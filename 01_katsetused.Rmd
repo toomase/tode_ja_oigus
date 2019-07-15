@@ -1,0 +1,199 @@
+---
+title: "Katsetused topic modelling tehnikaga Tõde ja Õigus tekstide peal"
+---
+
+```{r}
+library(tidyverse)
+library(wikisourcer)  # Tõde ja Õigus tekstide laadimiseks
+library(tidytext)
+library(topicmodels)
+library(hrbrthemes)
+library(drlib)
+library(tictoc)
+
+options(scipen = 99)
+
+# lae eestikeelsed stoppsõnad
+# need pärinevad siit: https://github.com/kristel-/estonian-stopwords/blob/master/estonian-stopwords.txt
+## detailsemalt on kirjeldatud selle stoppsõnade loetelu koostamist siin: http://www.tekstikaeve.ee/blog/2018-04-18-eestikeelsete-stoppsonade-loend/
+stopp_sonad <- read_csv("data/estonian-stopwords.txt", col_names = FALSE) %>% 
+  rename(sona = X1)
+
+# lae teised eestikeelsed stoppsõnad, mida olen ise varem kasutanud
+load("~/Dropbox/DataScience/R/presidendi_koned/data/stop_words_est.RData")
+```
+
+## Lae andmed
+
+
+Tõde ja Õigus tekstide lingid Wikisource lehel
+```{r}
+urlid <- c("https://et.wikisource.org/wiki/T%C3%B5de_ja_%C3%B5igus_I",
+           "https://et.wikisource.org/wiki/T%C3%B5de_ja_%C3%B5igus_II",
+           "https://et.wikisource.org/wiki/T%C3%B5de_ja_%C3%B5igus_III",
+           "https://et.wikisource.org/wiki/T%C3%B5de_ja_%C3%B5igus_IV",
+           "https://et.wikisource.org/wiki/T%C3%B5de_ja_%C3%B5igus_V")
+```
+
+Funktsioon, mis laeb raamatu teksti ja kirjutab eraldi veergu osa numbri
+```{r}
+import_tekst <- function(x, y){
+  wikisource_book(url = x) %>% 
+    mutate(osa = y)
+}
+```
+
+Lae alla kõigi Tõde ja Õigus osade tekstid Wikisource lehelt
+```{r}
+tic()
+tode_ja_oigus_raw <- map2_df(urlid, 1:5, import_tekst)
+toc()
+```
+
+Kirjuta Tõde ja Õigus tekstid eraldi faili, et seda oleks kergem kasutada blogipostituse kirjutamisel
+```{r}
+tode_ja_oigus_raw %>% 
+  write_rds("output/tode_jas_oigus_raw.rds")
+```
+
+
+
+## Tutvu andmetega
+
+
+```{r}
+glimpse(tode_ja_oigus_raw)
+```
+
+Kas kõigi osade tekstid on olems ja palju igas osas on peatükke?
+```{r}
+tode_ja_oigus_raw %>% 
+  group_by(osa) %>% 
+  summarise(peatukke = n_distinct(page))
+```
+
+
+## Puhast andmeid
+
+Peatükkide pealkirjad rooma numbrites, et need read tekstist eemaldada
+```{r}
+# maksimaalselt on raamatutes kuni 40 paragrahvi
+# väikese varuga tekita tabel rooma numbritest 1-50
+peatukk <- tibble(rooma_number = as.character(as.roman(1:50)),
+                  peatukk = 1:50)
+
+# lisa rooma numbri järgi punkt kuna 2-5 osas on peatükki peakiri just sellises formaadis
+peatukk_punktiga <- peatukk %>% 
+  mutate(rooma_number_punktiga = str_c(rooma_number, "."))
+```
+
+Eemalda tühja read ja read kus on ainult peatükki number.
+```{r}
+tode_ja_oigus <- tode_ja_oigus_raw %>% 
+  filter(!is.na(text), text != "") %>% 
+  anti_join(peatukk_punktiga, by = c("text" = "rooma_number")) %>% 
+  anti_join(peatukk_punktiga, by = c("text" = "rooma_number_punktiga")) %>% 
+  select(-language, -url, -title)
+
+glimpse(tode_ja_oigus)
+```
+
+
+## Ennusta õige raamat
+
+Kasuta topic modelling tehnikat, et ennustada sõnade põhjal, millise raamatuga on tegemist.
+
+Aluseks on võetud https://www.tidytextmining.com/topicmodeling.html#library-heist
+
+
+* iga sõna eraldi reale
+```{r}
+tode_ja_oigus_sonad <- tode_ja_oigus %>% 
+  mutate(dokument = str_c(osa, page, sep = "_")) %>% 
+  select(-page, -osa) %>% 
+  unnest_tokens(input = text, output = word)
+```
+
+* eemalda stoppsõnad
+* arvuta osa/peatüki lõikes iga sõna korduste arv
+```{r}
+sonade_arv <- tode_ja_oigus_sonad %>% 
+  anti_join(stopp_sonad, by = c("word" = "sona")) %>% 
+  anti_join(stop_words_est, by = c("word" = "sona")) %>% 
+  count(dokument, word, sort = TRUE) %>%
+  ungroup()
+
+sonade_arv
+```
+
+* koosta dtm objekt
+```{r}
+sonade_arv_dtm <- sonade_arv %>% 
+  cast_dtm(dokument, word, n)
+
+sonade_arv_dtm
+```
+
+* koosta LDA mudel
+* kasuta 5 topicut (k = 5) sest andmetes on 5 erinevat raamatut
+```{r}
+sonade_arv_lda <- LDA(sonade_arv_dtm, 
+                      k = 5,  # osade arv
+                      control = list(seed = 12345))
+
+sonade_arv_lda
+```
+
+Iga mudeli abil leitud topicu kohta kõige populaarsemad sõnad
+```{r fig.height=12, fig.width=8}
+sonade_arv_topics <- tidy(sonade_arv_lda, matrix = "beta")
+
+sonade_arv_topics %>% 
+  group_by(topic) %>%
+  top_n(20, beta) %>%
+  ungroup() %>%
+  arrange(topic, -beta) %>% 
+  ggplot(aes(drlib::reorder_within(term, beta, topic), beta, group = topic)) +
+  geom_col(fill = "#fc9272") +
+  drlib::scale_x_reordered() +
+  coord_flip() +
+  facet_wrap(~topic, scales = "free_y", ncol = 2) +
+  theme_ipsum_rc() +
+  scale_y_continuous(labels = scales::percent_format(0.1)) +
+  labs(title = "Tõde ja Õigus LDA mudeli teemade populaarsemad sõnad",
+       subtitle = "tõenäosus, et sõna on vastavast teemast",
+       x = "sõna",
+       y = "tõenäosus")
+
+```
+
+
+
+```{r fig.height=8, fig.width=8}
+tidy(sonade_arv_lda, matrix = "gamma") %>% 
+  separate(document, c("title", "chapter"), sep = "_", convert = TRUE) %>%
+  arrange(topic, desc(gamma)) %>% 
+  mutate(title = str_c("Tõde ja Õigus ", title)) %>% 
+  ggplot(aes(factor(topic), gamma)) +
+  geom_jitter(alpha = 0.2, width = 0.3, height = 0.05, colour = "#de2d26") +
+  facet_wrap(~ title, ncol = 2) +
+  theme_ipsum_rc() +
+  labs(title = "Tõde ja Õigus peatükkide teemamustrite leidmine (topic modelling)",
+       subtitle = "Graafik kujutab tõenäosust, iga raamatu peatüki kohta, \nmillisesse teemasse see kuulub.\nNäiteks Tõde ja Õigus I osas enamus peatükke kuulub teemasse 3",
+       x = "teema")
+
+```
+
+
+
+
+## Muu
+
+Tuleta eraldi real olevast paragrahvi nubrist (Rooma number I, II, III jne) eraldi veergu paragrahvi number nii, et igal real oleks küljes tema õige paragrahv.
+Tegelikult oli see ebavajalik protsess, kuna paragrahv on juba olemas veerus 'page', aga andmetöötluse mõttes jätan koodi alles.
+```{r}
+tode_ja_oigus_1 <- tode_ja_oigus_1_raw %>% 
+  left_join(peatukk, by = c("text" = "rooma_number")) %>% 
+  mutate(peatukk = runner::fill_run(peatukk)) %>%  # täida tühjad read viimase mitte NA väärtusega
+  filter(!is.na(text), text != "")
+```
